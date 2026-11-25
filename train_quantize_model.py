@@ -2,17 +2,16 @@
 """
 Train, INT8-quantize and export a tiny 4-class CNN for the ESP32-CAM sketch.
 
-Dataset layout (any image format, any size):
+Dataset layout (any image format, any size). Every sub-folder is one class,
+so use 2 folders for a simple detector, or more for more classes:
     dataset/
-      pigeon/*.jpg
-      monkey/*.jpg
-      human/*.jpg
-      other/*.jpg
+      monkey/*.jpg      <- the thing you want to detect
+      other/*.jpg       <- everything else (rooms, walls, trees, people, ...)
 
 Usage:
     pip install tensorflow numpy
     python train_quantize_model.py --data_dir dataset --epochs 40
-    python train_quantize_model.py --synthetic        # pipeline test, random data
+    python train_quantize_model.py --synthetic        # pipeline test, random data (2 classes)
 
 Outputs:
     model.tflite   - full-integer INT8 model
@@ -36,7 +35,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-CLASS_NAMES = ["pigeon", "monkey", "human", "other"]   # order == sketch order
+CLASS_NAMES = []   # filled in main(): the sub-folder names of --data_dir (alphabetical)
 IMG = 96
 MAX_MODEL_BYTES = 150 * 1024
 
@@ -46,11 +45,11 @@ def build_model(batch_size=None) -> keras.Model:
     x = inp
     for filters in (4, 16, 32, 64, 64):                # 96->48->24->12->6->3
         x = layers.Conv2D(filters, 3, strides=2, padding="same", use_bias=False)(x)
-        x = layers.BatchNormalization()(x)
+        x = layers.BatchNormalization(momentum=0.9)(x)   # faster-adapting running stats
         x = layers.ReLU(max_value=6.0)(x)              # ReLU6 quantizes well
     x = layers.Reshape((3 * 3 * 64,))(x)               # static reshape -> plain RESHAPE op
     x = layers.Dropout(0.3)(x)
-    out = layers.Dense(len(CLASS_NAMES), activation="softmax", name="probs")(x)
+    out = layers.Dense(len(CLASS_NAMES), activation="softmax", name="probs")(x)  # one output per class
     return keras.Model(inp, out, name="esp32cam_tiny_cnn")
 
 
@@ -68,16 +67,29 @@ def load_data(data_dir, batch):
     weights = {i: float(counts.sum() / (len(CLASS_NAMES) * max(counts[i], 1)))
                for i in range(len(CLASS_NAMES))}
 
-    augment = keras.Sequential([
+    geo = keras.Sequential([
         layers.RandomFlip("horizontal"),
         layers.RandomRotation(0.08),
         layers.RandomZoom(0.15),
-        layers.RandomContrast(0.3),
     ])
     norm = lambda x, y: (x / 255.0, y)
-    aug = lambda x, y: (tf.clip_by_value(augment(x, training=True), 0.0, 255.0) / 255.0, y)
 
-    train_ds = train_raw.map(aug, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    def degrade(x, y):
+        """Camera-like damage applied to EVERY image, whatever its class, so that
+        sharpness / noise / brightness cannot be used as a shortcut to guess the class.
+        (Web photos of one class are often softer than another's; the ESP32-CAM image
+        is soft and noisy for everything.)"""
+        x = geo(x, training=True)
+        s = tf.random.uniform([], 24, IMG + 1, dtype=tf.int32)      # random resolution
+        x = tf.image.resize(tf.image.resize(x, [s, s]), [IMG, IMG])  # = random blur
+        x = tf.image.random_contrast(x, 0.5, 1.4)
+        x = tf.image.random_brightness(x, 45.0)
+        x = x + tf.random.normal(tf.shape(x), 0.0, tf.random.uniform([], 0.0, 22.0))
+        return tf.clip_by_value(x, 0.0, 255.0) / 255.0, y
+
+    train_ds = (train_raw.unbatch().shuffle(2000)
+                .map(degrade, num_parallel_calls=tf.data.AUTOTUNE)
+                .batch(batch).prefetch(tf.data.AUTOTUNE))
     val_ds = val_raw.map(norm).prefetch(tf.data.AUTOTUNE)
     calib_ds = train_raw.map(norm)                     # un-augmented, for calibration
     return train_ds, val_ds, calib_ds, weights
@@ -136,7 +148,22 @@ def evaluate_int8(tflite_bytes, val_ds):
             interp.invoke()
             correct += int(np.argmax(interp.get_tensor(out["index"])[0]) == int(yb[i]))
             total += 1
-    print(f"INT8 validation accuracy: {correct / max(total, 1):.1%} ({total} images)")
+    print(f"INT8 validation accuracy (clean):    {correct / max(total, 1):.1%} ({total} images)")
+
+    # Same check on camera-like degraded images (blur + noise + dim): the number that
+    # matters for the real ESP32-CAM.
+    rng = np.random.default_rng(0)
+    correct = total = 0
+    for xb, yb in val_ds:
+        small = tf.image.resize(tf.image.resize(xb, [40, 40]), [IMG, IMG]).numpy()
+        small = np.clip(small * 0.8 + 0.05 + rng.normal(0, 0.05, small.shape), 0, 1)
+        for i in range(small.shape[0]):
+            q = np.clip(np.round(small[i:i + 1] / in_scale) + in_zp, -128, 127).astype(np.int8)
+            interp.set_tensor(inp["index"], q)
+            interp.invoke()
+            correct += int(np.argmax(interp.get_tensor(out["index"])[0]) == int(yb[i]))
+            total += 1
+    print(f"INT8 validation accuracy (degraded): {correct / max(total, 1):.1%}")
 
 
 def write_header(model_bytes: bytes, path: pathlib.Path):
@@ -145,10 +172,13 @@ def write_header(model_bytes: bytes, path: pathlib.Path):
         rows.append("  " + ", ".join(f"0x{b:02x}" for b in model_bytes[i:i + 12]))
     text = (
         "// Auto-generated by train_quantize_model.py - do not edit.\n"
-        "// INT8 model, input [1,96,96,1] = pixel/255, output 4 classes: "
+        "// INT8 model, input [1,96,96,1] = pixel/255, classes: "
         + ", ".join(CLASS_NAMES) + "\n"
         "#ifndef MODEL_DATA_H\n#define MODEL_DATA_H\n\n"
         f"const unsigned int g_model_len = {len(model_bytes)};\n\n"
+        f"const int g_num_classes = {len(CLASS_NAMES)};\n"
+        "const char* const g_class_names[] = {"
+        + ", ".join(f'"{c}"' for c in CLASS_NAMES) + "};\n\n"
         "const unsigned char g_model[] __attribute__((aligned(16))) = {\n"
         + ",\n".join(rows) + "\n};\n\n#endif  // MODEL_DATA_H\n"
     )
@@ -167,10 +197,18 @@ def main():
     args = ap.parse_args()
 
     if args.synthetic:
+        CLASS_NAMES[:] = ["monkey", "other"]
         print("*** SYNTHETIC MODE: model will be meaningless (pipeline test only) ***")
         train_ds, val_ds, calib_ds, weights = synthetic_data(args.batch)
         args.epochs = min(args.epochs, 2)
     else:
+        root = pathlib.Path(args.data_dir)
+        found = sorted(d.name for d in root.iterdir() if d.is_dir()) if root.is_dir() else []
+        if len(found) < 2:
+            raise SystemExit(f"Need at least 2 class folders inside '{args.data_dir}' "
+                             f"(e.g. monkey/ and other/). Found: {found}")
+        CLASS_NAMES[:] = found
+        print("Classes (order used on the ESP32):", CLASS_NAMES)
         train_ds, val_ds, calib_ds, weights = load_data(args.data_dir, args.batch)
 
     model = build_model()
@@ -178,7 +216,10 @@ def main():
     model.compile(optimizer=keras.optimizers.Adam(1e-3),
                   loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     model.fit(train_ds, validation_data=val_ds, epochs=args.epochs, class_weight=weights,
-              callbacks=[keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=8,
+              verbose=2,
+              callbacks=[keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                                           patience=4, min_lr=1e-5),
+                         keras.callbacks.EarlyStopping(monitor="val_loss", patience=15,
                                                        restore_best_weights=True)])
 
     tflite_bytes = quantize(model, calib_ds)
