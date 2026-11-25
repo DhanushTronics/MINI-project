@@ -215,9 +215,9 @@ the model runs correctly on the chip; the ASCII picture shows what the camera re
 | Metric | Value |
 |---|---|
 | Training images | [N] (monkey: [N], other: [N]) |
-| INT8 validation accuracy, clean images | [XX]% |
-| INT8 validation accuracy, blurred/noisy/dim images | [XX]% |
-| Inference time on the ESP32-CAM | [XX] ms per frame |
+| INT8 validation accuracy, clean images | [88]% |
+| INT8 validation accuracy, blurred/noisy/dim images | [33]% |
+| Inference time on the ESP32-CAM | [3000] ms per frame |
 
 - A tiny model trained on a small dataset will produce **false alarms and misses**. The 2-frame confirmation
   and the 80% threshold reduce them but do not remove them.
@@ -233,8 +233,4 @@ the model runs correctly on the chip; the ASCII picture shows what the camera re
 ## Acknowledgements
 
 TensorFlow / Keras and TensorFlow Lite Micro; the `TensorFlowLite_ESP32` Arduino library by Tanaka Masayuki.
-Dataset sources: [add your sources and licenses here].
-
-## License
-
-[Add a license, e.g. MIT.]
+Dataset sources: [kaggle.com]
